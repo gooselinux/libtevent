@@ -1,0 +1,486 @@
+diff -uPr tevent-0.9.8/script/abi_checks_gcc.sh tevent/script/abi_checks_gcc.sh
+--- tevent-0.9.8/script/abi_checks_gcc.sh	1969-12-31 19:00:00.000000000 -0500
++++ tevent/script/abi_checks_gcc.sh	2009-09-16 14:47:31.000000000 -0400
+@@ -0,0 +1,31 @@
++#!/bin/bash
++make clean
++
++mkdir abi
++ABI_CHECKS="-aux-info abi/\$@.X"
++make ABI_CHECK="$ABI_CHECKS" CC="/usr/bin/gcc"
++
++for i in abi/*.X; do cat $i | grep 'tevent\.h'; done | sort | uniq | awk -F "extern " '{ print $2 }' | sort> abi/signatures
++
++cat > abi/exports << EOF
++{
++    global:
++EOF
++cat abi/signatures | awk -F '(' '{ print $1 }' | awk -F ' ' '{ print "           "$NF";" }' | tr -d '*' | sort >> abi/exports
++cat >> abi/exports << EOF
++
++    local: *;
++};
++EOF
++
++rm -fr abi/*.X
++
++diff -u tevent.signatures abi/signatures
++if [ "$?" != "0" ]; then
++    echo "WARNING: Possible ABI Change!!"
++fi
++
++diff -u tevent.exports abi/exports
++if [ "$?" != "0" ]; then
++    echo "WARNING: Export file may be outdated!!"
++fi
+diff -uPr tevent-0.9.8/script/abi_checks.sh tevent/script/abi_checks.sh
+--- tevent-0.9.8/script/abi_checks.sh	1969-12-31 19:00:00.000000000 -0500
++++ tevent/script/abi_checks.sh	2009-09-16 14:47:31.000000000 -0400
+@@ -0,0 +1,91 @@
++#!/bin/sh
++
++#
++# abi_checks.sh - check for possible abi changes
++#
++# Copyright (C) 2009 Micheal Adam <obnox@samba.org>
++#
++# This program is free software; you can redistribute it and/or modify it
++# under the terms of the GNU General Public License as published by the Free
++# Software Foundation; either version 3 of the License, or (at your option)
++# any later version.
++#
++# This program is distributed in the hope that it will be useful, but WITHOUT
++# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++# more details.
++#
++# You should have received a copy of the GNU General Public License along with
++# this program; if not, see <http://www.gnu.org/licenses/>.
++#
++
++#
++# USAGE: abi_checks.sh LIBNAME header1 [header2 ...]
++#
++# This script creates symbol and signature lists from the provided header
++# files with the aid of the mksyms.sh and mksigs.pl scripts (saved as
++# $LIBNAME.exports.check and $LIBNAME.sigatures.check). It then compares
++# the resulting files with the files $LIBNAME.exports and $LIBNME.signatures
++# which it expects to find in the current directory.
++#
++
++LANG=C; export LANG
++LC_ALL=C; export LC_ALL
++LC_COLLATE=C; export LC_COLLATE
++
++script=$0
++dir_name=$(dirname ${script})
++
++if test x"$1" = "x" ; then
++	echo "USAGE: ${script} libname header [header ...]"
++	exit 1
++fi
++
++libname="$1"
++shift
++
++if test x"$1" = "x" ; then
++	echo "USAGE: ${script} libname header [header ...]"
++	exit 1
++fi
++
++headers="$*"
++
++exports_file=${libname}.exports
++exports_file_check=${exports_file}.check
++signatures_file=${libname}.signatures
++signatures_file_check=${signatures_file}.check
++
++
++${dir_name}/mksyms.sh awk ${exports_file_check} ${headers} 2>&1 > /dev/null
++
++cat ${headers} | ${dir_name}/mksigs.pl > ${signatures_file_check} 2> /dev/null
++
++normalize_exports_file() {
++	filename=$1
++	cat ${filename} \
++	| sed -e 's/^[ \t]*//g' \
++	| sed -e 's/^$//g' \
++	| sed -e 's/^#.*$//g' \
++	| sort | uniq > ${filename}.sort
++}
++
++normalize_exports_file ${exports_file}
++normalize_exports_file ${exports_file_check}
++
++normalize_exports_file ${signatures_file}
++normalize_exports_file ${signatures_file_check}
++
++diff -u ${exports_file}.sort ${exports_file_check}.sort
++if test "x$?" != "x0" ; then
++	echo "WARNING: possible ABI change detected in exports!"
++else
++	echo "exports check: OK"
++fi
++
++diff -u ${signatures_file}.sort ${signatures_file_check}.sort
++if test "x$?" != "x0" ; then
++	echo "WARNING: possible ABI change detected in signatures!"
++else
++	echo "signatures check: OK"
++fi
+diff -uPr tevent-0.9.8/script/mksigs.pl tevent/script/mksigs.pl
+--- tevent-0.9.8/script/mksigs.pl	1969-12-31 19:00:00.000000000 -0500
++++ tevent/script/mksigs.pl	2009-09-16 14:47:31.000000000 -0400
+@@ -0,0 +1,183 @@
++#!/usr/bin/perl
++
++# mksigs.pl - extract signatures from C headers
++#
++# Copyright (C) Michael Adam 2009
++#
++# This program is free software; you can redistribute it and/or modify it
++# under the terms of the GNU General Public License as published by the Free
++# Software Foundation; either version 3 of the License, or (at your option)
++# any later version.
++#
++# This program is distributed in the hope that it will be useful, but WITHOUT
++# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++# more details.
++#
++# You should have received a copy of the GNU General Public License along with
++# this program; if not, see <http://www.gnu.org/licenses/>.
++
++# USAGE:  cat $header_files | mksigs.pl > $signature_file
++#
++# The header files to parse are read from stdin.
++# The output is in a form as produced by gcc with the -aux-info switch
++# and printed to stdout.
++
++use strict;
++use warnings;
++
++my $in_comment = 0;
++my $extern_C_block = 0;
++
++while (my $LINE = <>) {
++	# find end of started multi-line-comment
++	if ($in_comment) {
++		if ($LINE =~ /^.*?\*\/(.*)$/) {
++			$LINE = $1;
++			$in_comment = 0;
++		} else {
++			# whole line within comment
++			next;
++		}
++	}
++
++	# strip C++-style comments
++	$LINE =~ s/^(.*?)\/\/.*$/$1/;
++
++	# strip in-line-comments:
++	while ($LINE =~ /\/\*.*?\*\//) {
++		$LINE =~ s/\/\*.*?\*\///;
++	}
++
++	# find starts of multi-line-comments
++	if ($LINE =~ /^(.*)\/\*/) {
++		$in_comment = 1;
++		$LINE = $1;
++	}
++
++	# skip empty lines
++	next if $LINE =~ /^\s*$/;
++
++	# remove leading spaces
++	$LINE =~ s/^\s*(.*)$/$1/;
++
++	# concatenate lines split with "\" (usually macro defines)
++	while ($LINE =~ /^(.*?)\s+\\$/) {
++		my $LINE2 = <>;
++		$LINE = $1;
++		$LINE2 =~ s/^\s*(.*)$/$1/;
++		$LINE .= " " . $LINE2;
++	}
++
++	# remove all preprocessor directives
++	next if ($LINE =~ /^#/);
++
++	if ($LINE =~ /^extern\s+"C"\s+\{/) {
++		$extern_C_block = 1;
++		next;
++	}
++
++	if (($LINE =~ /^[^\{]*\}/) and $extern_C_block) {
++		$extern_C_block = 0;
++		next;
++	}
++
++	$LINE =~ s/^extern\s//;
++
++	# concatenate braces stretched over multiple lines
++	# (from structs or enums)
++	my $REST = $LINE;
++	my $braces = 0;
++	while (($REST =~ /[\{\}]/) or ($braces)) {
++		while ($REST =~ /[\{\}]/) {
++			# collect opening
++			while ($REST =~ /^[^\{\}]*\{(.*)$/) {
++				$braces++;
++				$REST = $1;
++			}
++
++			# collect closing
++			while ($REST =~ /^[^\{\}]*\}(.*)$/) {
++				$braces--;
++				$REST = $1;
++			}
++		}
++
++		# concatenate if not balanced
++		if ($braces) {
++			if (my $LINE2 = <>) {
++				$LINE2 =~ s/^\s*(.*)$/$1/;
++				chomp($LINE);
++				$LINE .= " " . $LINE2;
++				chomp $REST;
++				$REST .= " " . $LINE2;
++			} else {
++				print "ERROR: unbalanced braces ($braces)\n";
++				last;
++			}
++		}
++	}
++
++	# concetenate function prototypes that stretch over multiple lines
++	$REST = $LINE;
++	my $parenthesis = 0;
++	while (($REST =~ /[\(\)]/) or ($parenthesis)) {
++		while ($REST =~ /[\(\)]/) {
++			# collect opening
++			while ($REST =~ /^[^\(\)]*\((.*)$/) {
++				$parenthesis++;
++				$REST = $1;
++			}
++
++			# collect closing
++			while ($REST =~ /^[^\(\)]*\)(.*)$/) {
++				$parenthesis--;
++				$REST = $1;
++			}
++		}
++
++		# concatenate if not balanced
++		if ($parenthesis) {
++			if (my $LINE2 = <>) {
++				$LINE2 =~ s/^\s*(.*)$/$1/;
++				chomp($LINE);
++				$LINE .= " " . $LINE2;
++				chomp($REST);
++				$REST .= " " . $LINE2;
++			} else {
++				print "ERROR: unbalanced parantheses ($parenthesis)\n";
++				last;
++			}
++		}
++	}
++
++	next if ($LINE =~ /^typedef\s/);
++	next if ($LINE =~ /^enum\s+[^\{\(]+\s+\{/);
++	next if ($LINE =~ /^struct\s+[^\{\(]+\s+\{.*\}\s*;/);
++	next if ($LINE =~ /^struct\s+[a-zA-Z0-9_]+\s*;/);
++
++	# remove trailing spaces
++	$LINE =~ s/(.*?)\s*$/$1/;
++
++	$LINE =~ s/^(.*\))\s+PRINTF_ATTRIBUTE\([^\)]*\)(\s*[;,])/$1$2/;
++	$LINE =~ s/^(.*\))\s*[a-zA-Z0-9_]+\s*;$/$1;/;
++
++	# remove parameter names - slightly too coarse probably
++	$LINE =~ s/([\s\(]\*?)[_0-9a-zA-Z]+\s*([,\)])/$1$2/g;
++
++	# remedy (void) from last line
++	$LINE =~ s/\(\)/(void)/g;
++
++	# normalize spaces
++	$LINE =~ s/\s*\)\s*/)/g;
++	$LINE =~ s/\s*\(\s*/ (/g;
++	$LINE =~ s/\s*,\s*/, /g;
++
++	# normalize unsigned
++	$LINE =~ s/([\s,\(])unsigned([,\)])/$1unsigned int$2/g;
++
++	# normalize bool
++	$LINE =~ s/(\b)bool(\b)/_Bool/g;
++
++	print $LINE . "\n";
++}
+diff -uPr tevent-0.9.8/script/mksyms.awk tevent/script/mksyms.awk
+--- tevent-0.9.8/script/mksyms.awk	1969-12-31 19:00:00.000000000 -0500
++++ tevent/script/mksyms.awk	2009-09-16 14:47:31.000000000 -0400
+@@ -0,0 +1,76 @@
++#
++# mksyms.awk
++#
++# Extract symbols to export from C-header files.
++# output in version-script format for linking shared libraries.
++#
++# Copyright (C) 2008 Michael Adam <obnox@samba.org>
++#
++BEGIN {
++	inheader=0;
++	current_file="";
++	print "#"
++	print "# This file is automatically generated with \"make symbols\". DO NOT EDIT "
++	print "#"
++	print "{"
++	print "\tglobal:"
++}
++
++END {
++	print""
++	print "\tlocal: *;"
++	print "};"
++}
++
++{
++	if (FILENAME!=current_file) {
++		print "\t\t# The following definitions come from",FILENAME
++		current_file=FILENAME
++	}
++	if (inheader) {
++		if (match($0,"[)][^()]*[;][ \t]*$")) {
++			inheader = 0;
++		}
++		next;
++	}
++}
++
++/^static/ || /^[ \t]*typedef/ || !/^[a-zA-Z\_]/ {
++	next;
++}
++
++/^extern[ \t]+[^()]+[;][ \t]*$/ {
++	gsub(/[^ \t]+[ \t]+/, "");
++	sub(/[;][ \t]*$/, "");
++	printf "\t\t%s;\n", $0;
++	next;
++}
++
++# look for function headers:
++{
++	gotstart = 0;
++	if ($0 ~ /^[A-Za-z_][A-Za-z0-9_]+/) {
++	gotstart = 1;
++	}
++	if(!gotstart) {
++		next;
++	}
++}
++
++/[_A-Za-z0-9]+[ \t]*[(].*[)][^()]*;[ \t]*$/ {
++	sub(/[(].*$/, "");
++	gsub(/[^ \t]+[ \t]+/, "");
++	gsub(/^[*]+/, "");
++	printf "\t\t%s;\n",$0;
++	next;
++}
++
++/[_A-Za-z0-9]+[ \t]*[(]/ {
++	inheader=1;
++	sub(/[(].*$/, "");
++	gsub(/[^ \t]+[ \t]+/, "");
++	gsub(/^[*]/, "");
++	printf "\t\t%s;\n",$0;
++	next;
++}
++
+diff -uPr tevent-0.9.8/script/mksyms.sh tevent/script/mksyms.sh
+--- tevent-0.9.8/script/mksyms.sh	1969-12-31 19:00:00.000000000 -0500
++++ tevent/script/mksyms.sh	2009-09-16 14:47:31.000000000 -0400
+@@ -0,0 +1,45 @@
++#! /bin/sh
++
++#
++# mksyms.sh
++#
++# Extract symbols to export from C-header files.
++# output in version-script format for linking shared libraries.
++#
++# This is the shell wrapper for the mksyms.awk core script.
++#
++# Copyright (C) 2008 Michael Adam <obnox@samba.org>
++#
++
++LANG=C; export LANG
++LC_ALL=C; export LC_ALL
++LC_COLLATE=C; export LC_COLLATE
++
++if [ $# -lt 2 ]
++then
++  echo "Usage: $0 awk output_file header_files"
++  exit 1
++fi
++
++awk="$1"
++shift
++
++symsfile="$1"
++shift
++symsfile_tmp="$symsfile.$$.tmp~"
++
++proto_src="`echo $@ | tr ' ' '\n' | sort | uniq `"
++
++echo creating $symsfile
++
++mkdir -p `dirname $symsfile`
++
++${awk} -f `dirname $0`/mksyms.awk $proto_src > $symsfile_tmp
++
++if cmp -s $symsfile $symsfile_tmp 2>/dev/null
++then
++  echo "$symsfile unchanged"
++  rm $symsfile_tmp
++else
++  mv $symsfile_tmp $symsfile
++fi
+diff -uPr tevent-0.9.8/tevent.exports tevent/tevent.exports
+--- tevent-0.9.8/tevent.exports	2009-08-30 13:58:36.000000000 -0400
++++ tevent/tevent.exports	2009-09-16 14:47:31.000000000 -0400
+@@ -55,6 +55,8 @@
+            tevent_timeval_zero;
+            tevent_wakeup_recv;
+            tevent_wakeup_send;
++           _tevent_req_cancel;
++           tevent_req_set_cancel_fn;
+ 
+     local: *;
+ };
+diff -uPr tevent-0.9.8/tevent.mk tevent/tevent.mk
+--- tevent-0.9.8/tevent.mk	2009-08-30 13:58:36.000000000 -0400
++++ tevent/tevent.mk	2009-09-16 14:47:31.000000000 -0400
+@@ -29,6 +29,14 @@
+ 
+ install:: all installdirs installheaders installlibs $(PYTHON_INSTALL_TARGET)
+ 
++abi_checks::
++	@echo ABI checks:
++	@chmod +x script/*
++	@./script/abi_checks.sh tevent tevent.h
++
++test:: abi_checks
++
+ clean::
+ 	rm -f $(TEVENT_SOBASE) $(TEVENT_SONAME) $(TEVENT_SOLIB) $(TEVENT_STLIB)
+ 	rm -f tevent.pc
++	rm -f tevent.exports.sort tevent.exports.check tevent.exports.check.sort
++	rm -f tevent.signatures.sort tevent.signatures.check tevent.signatures.check.sort
+diff -uPr tevent-0.9.8/tevent.signatures tevent/tevent.signatures
+--- tevent-0.9.8/tevent.signatures	2009-08-30 13:58:36.000000000 -0400
++++ tevent/tevent.signatures	2009-09-16 14:47:31.000000000 -0400
+@@ -53,3 +53,5 @@
+ void _tevent_schedule_immediate (struct tevent_immediate *, struct tevent_context *, tevent_immediate_handler_t, void *, const char *, const char *);
+ void tevent_set_abort_fn (void (*) (const char *));
+ void tevent_set_default_backend (const char *);
++_Bool _tevent_req_cancel (struct tevent_req *, const char *);
++void tevent_req_set_cancel_fn (struct tevent_req *, tevent_req_cancel_fn);
